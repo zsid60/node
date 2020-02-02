@@ -111,6 +111,7 @@ bool Runtime::NeedsExactContext(FunctionId id) {
     case Runtime::kCopyDataProperties:
     case Runtime::kCreateDataProperty:
     case Runtime::kCreatePrivateNameSymbol:
+    case Runtime::kCreatePrivateBrandSymbol:
     case Runtime::kLoadPrivateGetter:
     case Runtime::kLoadPrivateSetter:
     case Runtime::kReThrow:
@@ -188,6 +189,31 @@ bool Runtime::MayAllocate(FunctionId id) {
       return false;
     default:
       return true;
+  }
+}
+
+bool Runtime::IsWhitelistedForFuzzing(FunctionId id) {
+  CHECK(FLAG_allow_natives_for_fuzzing);
+  switch (id) {
+    // Runtime functions whitelisted for all fuzzers. Only add functions that
+    // help increase coverage or that perform extra checks.
+    case Runtime::kArrayBufferDetach:
+    case Runtime::kDeoptimizeFunction:
+    case Runtime::kDeoptimizeNow:
+    case Runtime::kEnableCodeLoggingForTesting:
+    case Runtime::kGetUndetectable:
+    case Runtime::kHeapObjectVerify:
+    case Runtime::kNeverOptimizeFunction:
+    case Runtime::kOptimizeFunctionOnNextCall:
+    case Runtime::kPrepareFunctionForOptimization:
+      return true;
+    // Runtime functions only permitted for non-differential fuzzers.
+    // This list may contain functions returning different values in the
+    // context of different flags passed to V8.
+    case Runtime::kIsBeingInterpreted:
+      return !FLAG_allow_natives_for_differential_fuzzing;
+    default:
+      return false;
   }
 }
 

@@ -78,10 +78,12 @@ var prettyPrinted = function prettyPrinted(msg) { return msg; };
   Date = new Proxy(Date, handler);
 })();
 
-// Mock performace.now().
-(function () {
-  performance.now = function () { return 1.2; }
-})();
+// Mock performance methods.
+performance.now = function () { return 1.2; }
+performance.measureMemory = function () { return []; }
+
+// Mock readline so that test cases don't hang.
+readline = function () { return "foo"; }
 
 // Mock stack traces.
 Error.prepareStackTrace = function (error, structuredStackTrace) {
@@ -91,13 +93,18 @@ Object.defineProperty(
     Error, 'prepareStackTrace', { configurable: false, writable: false });
 
 // Mock buffer access in float typed arrays because of varying NaN patterns.
-// Note, for now we just use noop forwarding proxies, because they already
-// turn off optimizations.
 (function () {
-  var mock = function(arrayType) {
-    var handler = {
+  const origIsNaN = isNaN;
+  const mock = function(arrayType) {
+    const handler = {
       construct: function(target, args) {
-        var obj = new (Function.prototype.bind.apply(arrayType, [null].concat(args)));
+        for (let i = 0; i < args.length; i++) {
+          if (origIsNaN(args[i])) {
+            args[i] = 1;
+          }
+        }
+        const obj = new (
+            Function.prototype.bind.call(arrayType, null, ...args));
         return new Proxy(obj, {
           get: function(x, prop) {
             if (typeof x[prop] == "function")

@@ -35,12 +35,39 @@ class Isolate;
 
 namespace wasm {
 
+class DebugInfo;
 class NativeModule;
 class WasmCodeManager;
 struct WasmCompilationResult;
 class WasmEngine;
 class WasmImportWrapperCache;
 struct WasmModule;
+
+// Convenience macro listing all wasm runtime stubs. Note that the first few
+// elements of the list coincide with {compiler::TrapId}, order matters.
+#define WASM_RUNTIME_STUB_LIST(V, VTRAP) \
+  FOREACH_WASM_TRAPREASON(VTRAP)         \
+  V(WasmCompileLazy)                     \
+  V(WasmAtomicNotify)                    \
+  V(WasmI32AtomicWait)                   \
+  V(WasmI64AtomicWait)                   \
+  V(WasmMemoryGrow)                      \
+  V(WasmTableGet)                        \
+  V(WasmTableSet)                        \
+  V(WasmStackGuard)                      \
+  V(WasmStackOverflow)                   \
+  V(WasmThrow)                           \
+  V(WasmRethrow)                         \
+  V(WasmTraceMemory)                     \
+  V(AllocateHeapNumber)                  \
+  V(ArgumentsAdaptorTrampoline)          \
+  V(BigIntToI32Pair)                     \
+  V(BigIntToI64)                         \
+  V(DoubleToI)                           \
+  V(I32PairToBigInt)                     \
+  V(I64ToBigInt)                         \
+  V(RecordWrite)                         \
+  V(ToNumber)
 
 // Sorted, disjoint and non-overlapping memory regions. A region is of the
 // form [start, end). So there's no [start, end), [end, other_end),
@@ -300,7 +327,6 @@ class WasmCodeAllocator {
   };
 
   WasmCodeAllocator(WasmCodeManager*, VirtualMemory code_space,
-                    bool can_request_more,
                     std::shared_ptr<Counters> async_counters);
   ~WasmCodeAllocator();
 
@@ -363,10 +389,6 @@ class WasmCodeAllocator {
   std::atomic<size_t> freed_code_size_{0};
 
   bool is_executable_ = false;
-
-  // TODO(clemensb): Remove this field once multiple code spaces are supported
-  // everywhere.
-  const bool can_request_more_memory_;
 
   std::shared_ptr<Counters> async_counters_;
 };
@@ -525,6 +547,11 @@ class V8_EXPORT_PRIVATE NativeModule final {
   // by publishing an entry stub with the {Kind::kInterpreterEntry} code kind.
   bool IsRedirectedToInterpreter(uint32_t func_index);
 
+  // Sets the flag, triggers recompilation of all methods to tier down or up,
+  // waits for that to complete.
+  void TierDown(Isolate* isolate);
+  void TierUp(Isolate* isolate);
+
   // Free a set of functions of this module. Uncommits whole pages if possible.
   // The given vector must be ordered by the instruction start address, and all
   // {WasmCode} objects must not be used any more.
@@ -534,6 +561,9 @@ class V8_EXPORT_PRIVATE NativeModule final {
 
   // Retrieve the number of separately reserved code spaces for this module.
   size_t GetNumberOfCodeSpacesForTesting() const;
+
+  // Get or create the debug info for this NativeModule.
+  DebugInfo* GetDebugInfo();
 
  private:
   friend class WasmCode;
@@ -549,7 +579,7 @@ class V8_EXPORT_PRIVATE NativeModule final {
 
   // Private constructor, called via {WasmCodeManager::NewNativeModule()}.
   NativeModule(WasmEngine* engine, const WasmFeatures& enabled_features,
-               bool can_request_more, VirtualMemory code_space,
+               VirtualMemory code_space,
                std::shared_ptr<const WasmModule> module,
                std::shared_ptr<Counters> async_counters,
                std::shared_ptr<NativeModule>* shared_this);
@@ -583,7 +613,7 @@ class V8_EXPORT_PRIVATE NativeModule final {
     DCHECK_LT(func_index, num_functions());
     DCHECK_LE(module_->num_imported_functions, func_index);
     if (!interpreter_redirections_) return false;
-    uint32_t bitset_idx = func_index - module_->num_imported_functions;
+    uint32_t bitset_idx = declared_function_index(module(), func_index);
     uint8_t byte = interpreter_redirections_[bitset_idx / kBitsPerByte];
     return byte & (1 << (bitset_idx % kBitsPerByte));
   }
@@ -597,7 +627,7 @@ class V8_EXPORT_PRIVATE NativeModule final {
           new uint8_t[RoundUp<kBitsPerByte>(module_->num_declared_functions) /
                       kBitsPerByte]{});
     }
-    uint32_t bitset_idx = func_index - module_->num_imported_functions;
+    uint32_t bitset_idx = declared_function_index(module(), func_index);
     uint8_t& byte = interpreter_redirections_[bitset_idx / kBitsPerByte];
     byte |= 1 << (bitset_idx % kBitsPerByte);
   }
@@ -660,6 +690,13 @@ class V8_EXPORT_PRIVATE NativeModule final {
   // Data (especially jump table) per code space.
   std::vector<CodeSpaceData> code_space_data_;
 
+  // Debug information for this module. You only need to hold the allocation
+  // mutex while getting the {DebugInfo} pointer, or initializing this field.
+  // Further accesses to the {DebugInfo} do not need to be protected by the
+  // mutex.
+  std::unique_ptr<DebugInfo> debug_info_;
+
+  bool tier_down_ = false;
   // End of fields protected by {allocation_mutex_}.
   //////////////////////////////////////////////////////////////////////////////
 
@@ -692,8 +729,21 @@ class V8_EXPORT_PRIVATE WasmCodeManager final {
     return total_committed_code_space_.load();
   }
 
-  static size_t EstimateNativeModuleCodeSize(const WasmModule* module);
-  static size_t EstimateNativeModuleNonCodeSize(const WasmModule* module);
+  // Estimate the needed code space for a Liftoff function based on the size of
+  // the function body (wasm byte code).
+  static size_t EstimateLiftoffCodeSize(int body_size);
+  // Estimate the needed code space from a completely decoded module.
+  static size_t EstimateNativeModuleCodeSize(const WasmModule* module,
+                                             bool include_liftoff);
+  // Estimate the needed code space from the number of functions and total code
+  // section length.
+  static size_t EstimateNativeModuleCodeSize(int num_functions,
+                                             int num_imported_functions,
+                                             int code_section_length,
+                                             bool include_liftoff);
+  // Estimate the size of meta data needed for the NativeModule, excluding
+  // generated code. This data still be stored on the C++ heap.
+  static size_t EstimateNativeModuleMetaDataSize(const WasmModule* module);
 
  private:
   friend class WasmCodeAllocator;
@@ -702,7 +752,7 @@ class V8_EXPORT_PRIVATE WasmCodeManager final {
   std::shared_ptr<NativeModule> NewNativeModule(
       WasmEngine* engine, Isolate* isolate,
       const WasmFeatures& enabled_features, size_t code_size_estimate,
-      bool can_request_more, std::shared_ptr<const WasmModule> module);
+      std::shared_ptr<const WasmModule> module);
 
   V8_WARN_UNUSED_RESULT VirtualMemory TryAllocate(size_t size,
                                                   void* hint = nullptr);
