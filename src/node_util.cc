@@ -263,6 +263,16 @@ static void GuessHandleType(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(OneByteString(env->isolate(), type));
 }
 
+void GetRDTSCP(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  unsigned int lo, hi;
+  __asm__ __volatile__ ("rdtscp" : "=a" (lo), "=d" (hi) : : "%rcx");
+  v8::Local<v8::Array> res = Array::New(env->isolate());
+  res->Set(env->context(), 0, v8::Uint32::NewFromUnsigned(env->isolate(), lo));
+  res->Set(env->context(), 1, v8::Uint32::NewFromUnsigned(env->isolate(), hi));
+  args.GetReturnValue().Set(res);
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
@@ -298,6 +308,8 @@ void Initialize(Local<Object> target,
                                      GetOwnNonIndexProperties);
   env->SetMethodNoSideEffect(target, "getConstructorName", GetConstructorName);
   env->SetMethod(target, "sleep", Sleep);
+  
+  env->SetMethod(target, "rdtscp", GetRDTSCP);
 
   env->SetMethod(target, "arrayBufferViewHasBuffer", ArrayBufferViewHasBuffer);
   Local<Object> constants = Object::New(env->isolate());
